@@ -2423,6 +2423,10 @@ stop6502(uint16_t address, uint8_t bank) {
 	} else if (testbench) {
 		printf("STP\n");
         fflush(stdout);
+	} else if (stp_ignore) {
+		return;
+	} else if (stp_reset) {
+		machine_reset();
 	} else {
 		int return_btn;
 		char error_message[80];

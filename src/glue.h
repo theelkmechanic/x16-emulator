@@ -79,6 +79,8 @@ extern uint8_t keymap;
 extern bool warp_mode;
 extern bool grab_mouse;
 extern bool testbench;
+extern bool stp_ignore;
+extern bool stp_reset;
 extern bool has_via2;
 extern uint32_t host_sample_rate;
 extern bool enable_midline;

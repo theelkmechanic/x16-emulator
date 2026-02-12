@@ -129,6 +129,8 @@ bool test_init_complete=false;
 bool headless = false;
 bool fullscreen = false;
 bool testbench = false;
+bool stp_ignore = false;
+bool stp_reset = false;
 bool enable_midline = false;
 bool ym2151_irq_support = false;
 char *cartridge_path = NULL;
@@ -516,6 +518,10 @@ usage()
 	printf("\tInstall the second VIA chip expansion at $9F10\n");
 	printf("-testbench\n");
 	printf("\tHeadless mode for unit testing with an external test runner\n");
+	printf("-stp-ignore\n");
+	printf("\tSilently ignore STP instructions instead of showing a dialog\n");
+	printf("-stp-reset\n");
+	printf("\tAutomatically reset the machine on STP instead of showing a dialog\n");
 	printf("-mhz <integer>\n");
 	printf("\tRun the emulator with a system clock speed other than the default of\n");
 	printf("\t8 MHz. Valid values are in the range of 1-40, inclusive. This option\n");
@@ -1105,6 +1111,14 @@ main(int argc, char **argv)
 			argv++;
 			testbench=true;
 			headless=true;
+		} else if (!strcmp(argv[0], "-stp-ignore")){
+			argc--;
+			argv++;
+			stp_ignore=true;
+		} else if (!strcmp(argv[0], "-stp-reset")){
+			argc--;
+			argv++;
+			stp_reset=true;
 		} else if (!strcmp(argv[0], "-mhz")){
 			argc--;
 			argv++;
