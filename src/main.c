@@ -43,6 +43,7 @@
 #include "testbench.h"
 #include "cartridge.h"
 #include "midi.h"
+#include "gdbstub.h"
 #include "git_rev.h"
 
 #ifdef __EMSCRIPTEN__
@@ -518,6 +519,8 @@ usage()
 	printf("\tInstall the second VIA chip expansion at $9F10\n");
 	printf("-testbench\n");
 	printf("\tHeadless mode for unit testing with an external test runner\n");
+	printf("-gdb [<port>]\n");
+	printf("\tEnable GDB remote serial protocol stub on the given TCP port (default: 2159)\n");
 	printf("-stp-ignore\n");
 	printf("\tSilently ignore STP instructions instead of showing a dialog\n");
 	printf("-stp-reset\n");
@@ -1111,6 +1114,16 @@ main(int argc, char **argv)
 			argv++;
 			testbench=true;
 			headless=true;
+		} else if (!strcmp(argv[0], "-gdb")){
+			argc--;
+			argv++;
+			uint16_t gdb_port = 2159;
+			if (argc && argv[0][0] != '-') {
+				gdb_port = (uint16_t)strtol(argv[0], NULL, 10);
+				argc--;
+				argv++;
+			}
+			gdbstub_init(gdb_port);
 		} else if (!strcmp(argv[0], "-stp-ignore")){
 			argc--;
 			argv++;
@@ -1324,6 +1337,10 @@ void main_shutdown() {
 		cartridge_unload();
 	}
 	files_shutdown();
+
+	if (gdb_enabled) {
+		gdbstub_shutdown();
+	}
 
 #ifdef PERFSTAT
 	for (int pc = 0xc000; pc < sizeof(stat)/sizeof(*stat); pc++) {
@@ -1609,6 +1626,12 @@ emulator_loop(void *param)
 			int dbgCmd = DEBUGGetCurrentStatus();
 			if (dbgCmd > 0) continue;
 			if (dbgCmd < 0) break;
+		}
+
+		if (gdb_enabled) {
+			int gdbCmd = gdbstub_poll();
+			if (gdbCmd > 0) continue;  // halted, don't step CPU
+			if (gdbCmd < 0) break;     // quit
 		}
 
 #ifdef PERFSTAT

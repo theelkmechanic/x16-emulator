@@ -196,6 +196,7 @@ set(X16_SOURCES
     src/timing.c
     src/wav_recorder.c
     src/testbench.c
+    src/gdbstub.c
     src/files.c
     src/cartridge.c
     src/iso_8859_15.c
@@ -254,7 +255,7 @@ if(WIN32)
             -Wl,--subsystem,console
         )
     endif()
-    target_link_libraries(x16emu PRIVATE dwmapi)
+    target_link_libraries(x16emu PRIVATE dwmapi ws2_32)
 endif()
 
 # macOS Specifics
