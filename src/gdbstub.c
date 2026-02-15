@@ -5,6 +5,7 @@
 #include "gdbstub.h"
 #include "glue.h"
 #include "memory.h"
+#include "video.h"
 #include "cpu/fake6502.h"
 
 #include <stdio.h>
@@ -49,6 +50,15 @@ bool gdb_connected = false;
 #define GDB_MAX_BREAKPOINTS 32
 #define GDB_PKT_BUF_SIZE   4096
 #define GDB_RECV_BUF_SIZE  4096
+
+// Extended address map for memory commands (m/M):
+//   $00000000-$0000FFFF  Plain 16-bit (current bank)
+//   $00010000-$00FFFFFF  Banked: bank=bits[23:16], cpu_addr=bits[15:0]
+//   $01000000-$0101FFFF  VERA VRAM (128KB)
+#define GDB_VRAM_BASE   0x01000000UL
+#define GDB_VRAM_END    0x01020000UL
+#define GDB_BANKED_BASE 0x00010000UL
+#define GDB_BANKED_END  0x01000000UL
 
 // -------------------------------------------------------------------
 // State machine
@@ -352,6 +362,24 @@ handle_write_register(const char *data)
 // Memory access
 // -------------------------------------------------------------------
 
+static uint8_t
+ext_read_byte(uint32_t addr)
+{
+	if (addr < GDB_BANKED_BASE) {
+		// Plain 16-bit address, current bank
+		return debug_read6502((uint16_t)addr, 0, USE_CURRENT_X16_BANK);
+	} else if (addr < GDB_BANKED_END) {
+		// Banked: bank=bits[23:16], cpu_addr=bits[15:0]
+		int16_t bank = (int16_t)((addr >> 16) & 0xFF);
+		uint16_t cpu_addr = (uint16_t)(addr & 0xFFFF);
+		return debug_read6502(cpu_addr, 0, bank);
+	} else if (addr < GDB_VRAM_END) {
+		// VERA VRAM
+		return video_space_read(addr - GDB_VRAM_BASE);
+	}
+	return 0xFF; // out of range
+}
+
 static void
 handle_read_memory(const char *data)
 {
@@ -368,16 +396,53 @@ handle_read_memory(const char *data)
 		len = (GDB_PKT_BUF_SIZE - 16) / 2;
 	}
 
+	// Reject reads starting entirely beyond the address map
+	if (addr >= GDB_VRAM_END) {
+		gdb_send_error(2);
+		return;
+	}
+
 	char buf[GDB_PKT_BUF_SIZE];
 	int pos = 0;
 	for (uint32_t i = 0; i < len; i++) {
-		uint16_t a = (uint16_t)((addr + i) & 0xffff);
-		uint8_t val = debug_read6502(a, 0, USE_CURRENT_X16_BANK);
+		uint8_t val = ext_read_byte(addr + i);
 		byte_to_hex(val, buf + pos);
 		pos += 2;
 	}
 	buf[pos] = '\0';
 	gdb_send_packet(buf);
+}
+
+static bool
+ext_write_byte(uint32_t addr, uint8_t val)
+{
+	if (addr < GDB_BANKED_BASE) {
+		// Plain 16-bit address
+		write6502((uint16_t)addr, 0, val);
+		return true;
+	} else if (addr < GDB_BANKED_END) {
+		// Banked: bank=bits[23:16], cpu_addr=bits[15:0]
+		uint8_t bank = (uint8_t)((addr >> 16) & 0xFF);
+		uint16_t cpu_addr = (uint16_t)(addr & 0xFFFF);
+		if (cpu_addr >= 0xA000 && cpu_addr < 0xC000) {
+			// Banked RAM — write directly
+			if (bank >= num_ram_banks) return false;
+			BRAM[((uint32_t)bank << 13) + cpu_addr - 0xA000] = val;
+			return true;
+		} else if (cpu_addr >= 0xC000) {
+			// ROM — read-only
+			return false;
+		} else {
+			// $0000-$9FFF: bank doesn't apply, plain write
+			write6502(cpu_addr, 0, val);
+			return true;
+		}
+	} else if (addr < GDB_VRAM_END) {
+		// VERA VRAM
+		video_space_write(addr - GDB_VRAM_BASE, val);
+		return true;
+	}
+	return false; // out of range
 }
 
 static void
@@ -399,8 +464,10 @@ handle_write_memory(const char *data)
 
 	for (uint32_t i = 0; i < len; i++) {
 		uint8_t val = (uint8_t)hex_to_u32(p, 2, &p);
-		uint16_t a = (uint16_t)((addr + i) & 0xffff);
-		write6502(a, 0, val);
+		if (!ext_write_byte(addr + i, val)) {
+			gdb_send_error(2);
+			return;
+		}
 	}
 	gdb_send_ok();
 }
@@ -577,7 +644,7 @@ handle_command(const char *pkt, int pkt_len)
 		case 'q':
 			// Query commands
 			if (strncmp(pkt, "qSupported", 10) == 0) {
-				gdb_send_packet("PacketSize=4096");
+				gdb_send_packet("PacketSize=4096;x16.addrsize=25");
 			} else if (strncmp(pkt, "qAttached", 9) == 0) {
 				gdb_send_packet("1");
 			} else {
