@@ -23,5 +23,10 @@ void gdbstub_report_stop(uint8_t signal);
 
 extern bool gdb_enabled;
 extern bool gdb_connected;
+extern bool gdb_watchpoints_active;
+
+// Called from memory.c to check watchpoints during CPU memory access
+void gdbstub_check_write(uint16_t addr, uint8_t value);
+void gdbstub_check_read(uint16_t addr);
 
 #endif

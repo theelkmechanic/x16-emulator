@@ -90,11 +90,55 @@ static int recv_len = 0;
 
 struct gdb_breakpoint {
 	uint16_t addr;
+	uint8_t  bank;      // bank number from GDB 24-bit address bits[23:16]
+	bool     banked;    // true if addr >= $A000 (bank-sensitive region)
 	bool     active;
 };
 
 static struct gdb_breakpoint breakpoints[GDB_MAX_BREAKPOINTS];
 static int num_breakpoints = 0;
+
+// -------------------------------------------------------------------
+// Range stepping (vCont;r)
+// -------------------------------------------------------------------
+
+static bool range_stepping = false;
+static uint16_t range_step_start = 0;
+static uint16_t range_step_end = 0;
+
+// -------------------------------------------------------------------
+// Watchpoints (Z2/Z3/Z4)
+// -------------------------------------------------------------------
+
+#define GDB_MAX_WATCHPOINTS 16
+
+typedef enum { WP_WRITE = 2, WP_READ = 3, WP_ACCESS = 4 } wp_type_t;
+
+struct gdb_watchpoint {
+	uint32_t  addr;     // 24-bit (bank:cpuaddr), same encoding as m/M packets
+	uint32_t  len;      // byte count of watched region
+	wp_type_t type;
+	bool      active;
+};
+
+static struct gdb_watchpoint watchpoints[GDB_MAX_WATCHPOINTS];
+static int num_watchpoints = 0;
+bool gdb_watchpoints_active = false;
+static bool wp_hit = false;
+static uint32_t wp_hit_addr = 0;
+static wp_type_t wp_hit_type = WP_WRITE;
+
+// -------------------------------------------------------------------
+// Bank helpers
+// -------------------------------------------------------------------
+
+static uint8_t
+get_current_bank_for_addr(uint16_t addr)
+{
+	if (addr >= 0xC000) return memory_get_rom_bank();
+	if (addr >= 0xA000) return memory_get_ram_bank();
+	return 0;
+}
 
 // -------------------------------------------------------------------
 // Helpers: hex encoding
@@ -466,14 +510,21 @@ handle_write_memory(const char *data)
 // Breakpoints
 // -------------------------------------------------------------------
 
+static void handle_set_watchpoint(const char *data);
+static void handle_remove_watchpoint(const char *data);
+
 static void
 handle_set_breakpoint(const char *data)
 {
-	// Z0,addr,kind
+	// Z<type>,addr,kind
 	const char *p = data;
 	uint32_t type = hex_to_u32(p, 2, &p);
-	if (type != 0) {
-		// Only software breakpoints supported
+	if (type >= 2) {
+		// Watchpoint types 2/3/4
+		handle_set_watchpoint(data);
+		return;
+	}
+	if (type != 0 && type != 1) {
 		gdb_send_empty();
 		return;
 	}
@@ -485,23 +536,26 @@ handle_set_breakpoint(const char *data)
 	uint32_t addr = hex_to_u32(p, 8, &p);
 	// kind field ignored for 65C02
 
+	uint16_t cpu_addr = (uint16_t)(addr & 0xFFFF);
+	uint8_t bank = (uint8_t)((addr >> 16) & 0xFF);
+	bool banked = (cpu_addr >= 0xA000);
+
 	// Check if already set
 	for (int i = 0; i < num_breakpoints; i++) {
-		if (breakpoints[i].active && breakpoints[i].addr == (uint16_t)addr) {
-			gdb_send_ok();
-			return;
+		if (breakpoints[i].active && breakpoints[i].addr == cpu_addr) {
+			if (!banked || breakpoints[i].bank == bank) {
+				gdb_send_ok();
+				return;
+			}
 		}
 	}
 
 	// Find a free slot
-	if (num_breakpoints >= GDB_MAX_BREAKPOINTS) {
-		gdb_send_error(2);
-		return;
-	}
-
 	for (int i = 0; i < GDB_MAX_BREAKPOINTS; i++) {
 		if (!breakpoints[i].active) {
-			breakpoints[i].addr = (uint16_t)addr;
+			breakpoints[i].addr = cpu_addr;
+			breakpoints[i].bank = bank;
+			breakpoints[i].banked = banked;
 			breakpoints[i].active = true;
 			if (i >= num_breakpoints) num_breakpoints = i + 1;
 			gdb_send_ok();
@@ -514,10 +568,15 @@ handle_set_breakpoint(const char *data)
 static void
 handle_remove_breakpoint(const char *data)
 {
-	// z0,addr,kind
+	// z<type>,addr,kind
 	const char *p = data;
 	uint32_t type = hex_to_u32(p, 2, &p);
-	if (type != 0) {
+	if (type >= 2) {
+		// Watchpoint types 2/3/4
+		handle_remove_watchpoint(data);
+		return;
+	}
+	if (type != 0 && type != 1) {
 		gdb_send_empty();
 		return;
 	}
@@ -528,11 +587,17 @@ handle_remove_breakpoint(const char *data)
 	p++;
 	uint32_t addr = hex_to_u32(p, 8, &p);
 
+	uint16_t cpu_addr = (uint16_t)(addr & 0xFFFF);
+	uint8_t bank = (uint8_t)((addr >> 16) & 0xFF);
+	bool banked = (cpu_addr >= 0xA000);
+
 	for (int i = 0; i < num_breakpoints; i++) {
-		if (breakpoints[i].active && breakpoints[i].addr == (uint16_t)addr) {
-			breakpoints[i].active = false;
-			gdb_send_ok();
-			return;
+		if (breakpoints[i].active && breakpoints[i].addr == cpu_addr) {
+			if (!banked || breakpoints[i].bank == bank) {
+				breakpoints[i].active = false;
+				gdb_send_ok();
+				return;
+			}
 		}
 	}
 	gdb_send_ok(); // not found is still OK per GDB spec
@@ -543,10 +608,217 @@ check_breakpoints(void)
 {
 	for (int i = 0; i < num_breakpoints; i++) {
 		if (breakpoints[i].active && breakpoints[i].addr == regs.pc) {
-			return true;
+			if (!breakpoints[i].banked) {
+				return true;
+			}
+			// Bank-sensitive: compare current bank
+			if (breakpoints[i].bank == get_current_bank_for_addr(regs.pc)) {
+				return true;
+			}
 		}
 	}
 	return false;
+}
+
+// -------------------------------------------------------------------
+// Watchpoint helpers
+// -------------------------------------------------------------------
+
+static void
+update_watchpoints_active(void)
+{
+	gdb_watchpoints_active = false;
+	for (int i = 0; i < num_watchpoints; i++) {
+		if (watchpoints[i].active) {
+			gdb_watchpoints_active = true;
+			return;
+		}
+	}
+}
+
+static void
+handle_set_watchpoint(const char *data)
+{
+	// Z<type>,addr,len
+	const char *p = data;
+	uint32_t type = hex_to_u32(p, 2, &p);
+	if (type < 2 || type > 4) {
+		gdb_send_empty();
+		return;
+	}
+	if (*p != ',') {
+		gdb_send_error(1);
+		return;
+	}
+	p++;
+	uint32_t addr = hex_to_u32(p, 8, &p);
+	if (*p != ',') {
+		gdb_send_error(1);
+		return;
+	}
+	p++;
+	uint32_t len = hex_to_u32(p, 8, &p);
+	if (len == 0) len = 1;
+
+	// Check if already set
+	for (int i = 0; i < num_watchpoints; i++) {
+		if (watchpoints[i].active &&
+		    watchpoints[i].addr == addr &&
+		    watchpoints[i].len == len &&
+		    watchpoints[i].type == (wp_type_t)type) {
+			gdb_send_ok();
+			return;
+		}
+	}
+
+	// Find a free slot
+	for (int i = 0; i < GDB_MAX_WATCHPOINTS; i++) {
+		if (!watchpoints[i].active) {
+			watchpoints[i].addr = addr;
+			watchpoints[i].len = len;
+			watchpoints[i].type = (wp_type_t)type;
+			watchpoints[i].active = true;
+			if (i >= num_watchpoints) num_watchpoints = i + 1;
+			update_watchpoints_active();
+			gdb_send_ok();
+			return;
+		}
+	}
+	gdb_send_error(2);
+}
+
+static void
+handle_remove_watchpoint(const char *data)
+{
+	// z<type>,addr,len
+	const char *p = data;
+	uint32_t type = hex_to_u32(p, 2, &p);
+	if (type < 2 || type > 4) {
+		gdb_send_empty();
+		return;
+	}
+	if (*p != ',') {
+		gdb_send_error(1);
+		return;
+	}
+	p++;
+	uint32_t addr = hex_to_u32(p, 8, &p);
+	if (*p != ',') {
+		gdb_send_error(1);
+		return;
+	}
+	p++;
+	uint32_t len = hex_to_u32(p, 8, &p);
+	if (len == 0) len = 1;
+
+	for (int i = 0; i < num_watchpoints; i++) {
+		if (watchpoints[i].active &&
+		    watchpoints[i].addr == addr &&
+		    watchpoints[i].len == len &&
+		    watchpoints[i].type == (wp_type_t)type) {
+			watchpoints[i].active = false;
+			update_watchpoints_active();
+			gdb_send_ok();
+			return;
+		}
+	}
+	gdb_send_ok(); // not found is still OK per GDB spec
+}
+
+void
+gdbstub_check_write(uint16_t addr, uint8_t value)
+{
+	(void)value;
+	uint32_t full_addr;
+	if (addr >= 0xA000) {
+		full_addr = ((uint32_t)get_current_bank_for_addr(addr) << 16) | addr;
+	} else {
+		full_addr = addr;
+	}
+
+	for (int i = 0; i < num_watchpoints; i++) {
+		if (!watchpoints[i].active) continue;
+		if (watchpoints[i].type != WP_WRITE && watchpoints[i].type != WP_ACCESS) continue;
+		if (full_addr >= watchpoints[i].addr &&
+		    full_addr < watchpoints[i].addr + watchpoints[i].len) {
+			wp_hit = true;
+			wp_hit_addr = full_addr;
+			wp_hit_type = watchpoints[i].type;
+			return;
+		}
+	}
+}
+
+void
+gdbstub_check_read(uint16_t addr)
+{
+	uint32_t full_addr;
+	if (addr >= 0xA000) {
+		full_addr = ((uint32_t)get_current_bank_for_addr(addr) << 16) | addr;
+	} else {
+		full_addr = addr;
+	}
+
+	for (int i = 0; i < num_watchpoints; i++) {
+		if (!watchpoints[i].active) continue;
+		if (watchpoints[i].type != WP_READ && watchpoints[i].type != WP_ACCESS) continue;
+		if (full_addr >= watchpoints[i].addr &&
+		    full_addr < watchpoints[i].addr + watchpoints[i].len) {
+			wp_hit = true;
+			wp_hit_addr = full_addr;
+			wp_hit_type = watchpoints[i].type;
+			return;
+		}
+	}
+}
+
+// -------------------------------------------------------------------
+// vCont support
+// -------------------------------------------------------------------
+
+static void
+handle_v_command(const char *data, int len)
+{
+	if (len >= 5 && strncmp(data, "Cont?", 5) == 0) {
+		gdb_send_packet("vCont;c;s;t;r");
+		return;
+	}
+
+	if (len >= 5 && strncmp(data, "Cont;", 5) == 0) {
+		const char *action = data + 5;
+		switch (action[0]) {
+			case 'c':
+				range_stepping = false;
+				gdb_state = GDB_STATE_RUNNING;
+				return;
+			case 's':
+				range_stepping = false;
+				step6502();
+				gdb_state = GDB_STATE_STOPPED;
+				gdb_send_packet("S05");
+				return;
+			case 't':
+				range_stepping = false;
+				gdb_state = GDB_STATE_STOPPED;
+				gdb_send_packet("S02");
+				return;
+			case 'r': {
+				// vCont;r start,end — range stepping
+				const char *p = action + 1;
+				range_step_start = (uint16_t)hex_to_u32(p, 8, &p);
+				if (*p == ',') p++;
+				range_step_end = (uint16_t)hex_to_u32(p, 8, &p);
+				range_stepping = true;
+				gdb_state = GDB_STATE_RUNNING;
+				return;
+			}
+			default:
+				break;
+		}
+	}
+
+	// Unrecognized v command
+	gdb_send_empty();
 }
 
 // -------------------------------------------------------------------
@@ -561,7 +833,7 @@ handle_command(const char *pkt, int pkt_len)
 	switch (pkt[0]) {
 		case '?':
 			// Halt reason
-			gdb_send_packet("S05");
+			gdbstub_report_stop(5);
 			break;
 
 		case 'g':
@@ -634,12 +906,28 @@ handle_command(const char *pkt, int pkt_len)
 		case 'q':
 			// Query commands
 			if (strncmp(pkt, "qSupported", 10) == 0) {
-				gdb_send_packet("PacketSize=4096;x16.addrsize=25");
+				gdb_send_packet("PacketSize=4096;x16.addrsize=25;hwbreak+;vContSupported+");
 			} else if (strncmp(pkt, "qAttached", 9) == 0) {
 				gdb_send_packet("1");
+			} else if (strncmp(pkt, "qC", 2) == 0 && pkt[2] == '\0') {
+				gdb_send_packet("QC0");
+			} else if (strncmp(pkt, "qfThreadInfo", 12) == 0) {
+				gdb_send_packet("m0");
+			} else if (strncmp(pkt, "qsThreadInfo", 12) == 0) {
+				gdb_send_packet("l");
+			} else if (strncmp(pkt, "qTStatus", 8) == 0) {
+				gdb_send_packet("T0");
+			} else if (strncmp(pkt, "qOffsets", 8) == 0) {
+				gdb_send_packet("Text=0;Data=0;Bss=0");
+			} else if (strncmp(pkt, "qSymbol::", 9) == 0) {
+				gdb_send_ok();
 			} else {
 				gdb_send_empty();
 			}
+			break;
+
+		case 'v':
+			handle_v_command(pkt + 1, pkt_len - 1);
 			break;
 
 		default:
@@ -765,11 +1053,19 @@ accept_connection(void)
 	printf("[GDB] Client connected from %s:%d\n",
 	       inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-	// Clear breakpoints on new connection
+	// Clear breakpoints and watchpoints on new connection
 	for (int i = 0; i < GDB_MAX_BREAKPOINTS; i++) {
 		breakpoints[i].active = false;
 	}
 	num_breakpoints = 0;
+
+	for (int i = 0; i < GDB_MAX_WATCHPOINTS; i++) {
+		watchpoints[i].active = false;
+	}
+	num_watchpoints = 0;
+	gdb_watchpoints_active = false;
+	wp_hit = false;
+	range_stepping = false;
 }
 
 // -------------------------------------------------------------------
@@ -956,6 +1252,35 @@ gdbstub_poll(void)
 			// Check breakpoints after each instruction
 			if (check_breakpoints()) {
 				gdb_state = GDB_STATE_STOPPED;
+				range_stepping = false;
+				wp_hit = false;
+				gdbstub_report_stop(5); // SIGTRAP
+				return 1;
+			}
+
+			// Check watchpoints
+			if (wp_hit) {
+				gdb_state = GDB_STATE_STOPPED;
+				range_stepping = false;
+				// Send stop reply with watchpoint info
+				char wp_reply[64];
+				const char *wp_kind;
+				switch (wp_hit_type) {
+					case WP_READ:   wp_kind = "rwatch"; break;
+					case WP_ACCESS: wp_kind = "awatch"; break;
+					default:        wp_kind = "watch";  break;
+				}
+				snprintf(wp_reply, sizeof(wp_reply), "T05%s:%x;", wp_kind, wp_hit_addr);
+				gdb_send_packet(wp_reply);
+				wp_hit = false;
+				return 1;
+			}
+
+			// Range stepping: stop when PC leaves the range
+			if (range_stepping &&
+			    (regs.pc < range_step_start || regs.pc >= range_step_end)) {
+				gdb_state = GDB_STATE_STOPPED;
+				range_stepping = false;
 				gdbstub_report_stop(5); // SIGTRAP
 				return 1;
 			}
@@ -977,9 +1302,22 @@ gdbstub_report_stop(uint8_t signal)
 {
 	if (client_sock == SOCKET_INVALID) return;
 
-	char buf[8];
-	buf[0] = 'S';
-	byte_to_hex(signal, buf + 1);
-	buf[3] = '\0';
+	// Use T format with PC register value to reduce follow-up queries
+	// T SS 04:pclo,pchi;
+	char buf[32];
+	int pos = 0;
+	buf[pos++] = 'T';
+	byte_to_hex(signal, buf + pos);
+	pos += 2;
+	// Register 4 = PC (16-bit LE)
+	buf[pos++] = '0';
+	buf[pos++] = '4';
+	buf[pos++] = ':';
+	byte_to_hex((uint8_t)(regs.pc & 0xff), buf + pos);
+	pos += 2;
+	byte_to_hex((uint8_t)((regs.pc >> 8) & 0xff), buf + pos);
+	pos += 2;
+	buf[pos++] = ';';
+	buf[pos] = '\0';
 	gdb_send_packet(buf);
 }

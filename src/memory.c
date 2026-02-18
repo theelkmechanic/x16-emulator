@@ -19,6 +19,7 @@
 #include "cartridge.h"
 #include "iso_8859_15.h"
 #include "midi.h"
+#include "gdbstub.h"
 
 uint8_t ram_bank;
 uint8_t rom_bank;
@@ -162,6 +163,9 @@ static const char *format_addr(uint16_t address, uint8_t bank, uint8_t x16Bank) 
 uint8_t
 read6502(uint16_t address, uint8_t bank) {
 	if (!is_gen2) bank = 0;
+
+	if (gdb_enabled && gdb_watchpoints_active) gdbstub_check_read(address);
+
 	// Report access to uninitialized RAM (if option selected)
 	if (reportUninitializedAccess) {
 		if (bank == 0) {
@@ -270,6 +274,8 @@ void
 write6502(uint16_t address, uint8_t bank, uint8_t value)
 {
 	if (!is_gen2) bank = 0;
+
+	if (gdb_enabled && gdb_watchpoints_active) gdbstub_check_write(address, value);
 
 	if(reportUsageStatisticsFilename!=NULL) {
 		if (bank != 0 || address < 0xa000) {
