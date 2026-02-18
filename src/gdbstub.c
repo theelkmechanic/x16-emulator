@@ -52,13 +52,10 @@ bool gdb_connected = false;
 #define GDB_RECV_BUF_SIZE  4096
 
 // Extended address map for memory commands (m/M):
-//   $00000000-$0000FFFF  Plain 16-bit (current bank)
-//   $00010000-$00FFFFFF  Banked: bank=bits[23:16], cpu_addr=bits[15:0]
+//   $00000000-$00FFFFFF  Banked: bank=bits[23:16], cpu_addr=bits[15:0]
 //   $01000000-$0101FFFF  VERA VRAM (128KB)
 #define GDB_VRAM_BASE   0x01000000UL
 #define GDB_VRAM_END    0x01020000UL
-#define GDB_BANKED_BASE 0x00010000UL
-#define GDB_BANKED_END  0x01000000UL
 
 // -------------------------------------------------------------------
 // State machine
@@ -365,10 +362,7 @@ handle_write_register(const char *data)
 static uint8_t
 ext_read_byte(uint32_t addr)
 {
-	if (addr < GDB_BANKED_BASE) {
-		// Plain 16-bit address, current bank
-		return debug_read6502((uint16_t)addr, 0, USE_CURRENT_X16_BANK);
-	} else if (addr < GDB_BANKED_END) {
+	if (addr < GDB_VRAM_BASE) {
 		// Banked: bank=bits[23:16], cpu_addr=bits[15:0]
 		int16_t bank = (int16_t)((addr >> 16) & 0xFF);
 		uint16_t cpu_addr = (uint16_t)(addr & 0xFFFF);
@@ -416,11 +410,7 @@ handle_read_memory(const char *data)
 static bool
 ext_write_byte(uint32_t addr, uint8_t val)
 {
-	if (addr < GDB_BANKED_BASE) {
-		// Plain 16-bit address
-		write6502((uint16_t)addr, 0, val);
-		return true;
-	} else if (addr < GDB_BANKED_END) {
+	if (addr < GDB_VRAM_BASE) {
 		// Banked: bank=bits[23:16], cpu_addr=bits[15:0]
 		uint8_t bank = (uint8_t)((addr >> 16) & 0xFF);
 		uint16_t cpu_addr = (uint16_t)(addr & 0xFFFF);
