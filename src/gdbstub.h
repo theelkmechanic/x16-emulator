@@ -21,6 +21,10 @@ int gdbstub_poll(void);
 // Notify GDB that the CPU stopped (e.g. breakpoint hit, step complete)
 void gdbstub_report_stop(uint8_t signal);
 
+// Request a halt from outside the GDB stub (e.g. STP instruction, BRK).
+// Sets the GDB state to STOPPED and sends the given signal to the client.
+void gdbstub_break(uint8_t signal);
+
 extern bool gdb_enabled;
 extern bool gdb_connected;
 extern bool gdb_watchpoints_active;

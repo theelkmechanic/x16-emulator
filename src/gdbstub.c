@@ -1298,6 +1298,17 @@ gdbstub_poll(void)
 }
 
 void
+gdbstub_break(uint8_t signal)
+{
+	if (gdb_state == GDB_STATE_RUNNING || gdb_state == GDB_STATE_STOPPED) {
+		gdb_state = GDB_STATE_STOPPED;
+		range_stepping = false;
+		wp_hit = false;
+		gdbstub_report_stop(signal);
+	}
+}
+
+void
 gdbstub_report_stop(uint8_t signal)
 {
 	if (client_sock == SOCKET_INVALID) return;

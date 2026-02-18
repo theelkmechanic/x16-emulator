@@ -12,6 +12,7 @@
 #include "memory.h"
 #include "glue.h"
 #include "debugger.h"
+#include "gdbstub.h"
 #include "keyboard.h"
 #include "gif.h"
 #include "joystick.h"
@@ -2418,6 +2419,10 @@ bool video_is_special_address(int addr)
 
 void
 stop6502(uint16_t address, uint8_t bank) {
+	if (gdb_enabled && gdb_connected) {
+		gdbstub_break(5); // SIGTRAP
+		return;
+	}
 	if (debugger_enabled) {
 		DEBUGBreakToDebugger();
 	} else if (testbench) {

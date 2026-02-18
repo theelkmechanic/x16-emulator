@@ -1622,7 +1622,7 @@ emulator_loop(void *param)
 			testbench_init();
 		}
 
-		if (debugger_enabled) {
+		if (debugger_enabled && !(gdb_enabled && gdb_connected)) {
 			int dbgCmd = DEBUGGetCurrentStatus();
 			if (dbgCmd > 0) continue;
 			if (dbgCmd < 0) break;

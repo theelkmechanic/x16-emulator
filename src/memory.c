@@ -527,7 +527,7 @@ emu_write(uint8_t reg, uint8_t value)
 {
 	bool v = value != 0;
 	switch (reg) {
-		case 0: debugger_enabled = v; break;
+		case 0: if (!(gdb_enabled && gdb_connected)) debugger_enabled = v; break;
 		case 1: log_video = v; break;
 		case 2: log_keyboard = v; break;
 		case 3: echo_mode = value; break;
