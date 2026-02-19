@@ -164,6 +164,13 @@ static void brk() {
     penaltyn = 1;
     regs.pc++;
 
+    if (gdb_enabled) {
+        // Report BRK to GDB instead of letting the KERNAL monitor handle it
+        regs.pc -= 2;  // point PC back at the BRK instruction (undo fetch + skip)
+        gdbstub_break(5); // SIGTRAP
+        return;
+    }
+
     interrupt6502(INT_BRK);
 }
 

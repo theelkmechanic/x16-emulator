@@ -2419,7 +2419,7 @@ bool video_is_special_address(int addr)
 
 void
 stop6502(uint16_t address, uint8_t bank) {
-	if (gdb_enabled && gdb_connected) {
+	if (gdb_enabled) {
 		gdbstub_break(5); // SIGTRAP
 		return;
 	}

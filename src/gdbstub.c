@@ -825,6 +825,76 @@ handle_v_command(const char *data, int len)
 // Command dispatch
 // -------------------------------------------------------------------
 
+// -------------------------------------------------------------------
+// Monitor command handler (qRcmd)
+// Decodes hex-encoded command string and dispatches trace commands.
+// -------------------------------------------------------------------
+
+#ifdef TRACE
+extern bool trace_mode;
+extern uint16_t trace_address;
+#endif
+
+static void
+gdb_send_monitor_output(const char *msg)
+{
+	// qRcmd response: 'O' followed by hex-encoded ASCII output
+	int len = (int)strlen(msg);
+	char buf[GDB_PKT_BUF_SIZE];
+	buf[0] = 'O';
+	for (int i = 0; i < len && (2 * i + 3) < GDB_PKT_BUF_SIZE; i++) {
+		byte_to_hex((uint8_t)msg[i], buf + 1 + 2 * i);
+	}
+	buf[1 + 2 * len] = '\0';
+	gdb_send_packet(buf);
+}
+
+static void
+handle_monitor_command(const char *hex_cmd)
+{
+	// Decode hex-encoded ASCII command
+	int hex_len = (int)strlen(hex_cmd);
+	char cmd[256];
+	int cmd_len = 0;
+	for (int i = 0; i + 1 < hex_len && cmd_len < (int)sizeof(cmd) - 1; i += 2) {
+		int hi = hex_digit(hex_cmd[i]);
+		int lo = hex_digit(hex_cmd[i + 1]);
+		if (hi < 0 || lo < 0) break;
+		cmd[cmd_len++] = (char)((hi << 4) | lo);
+	}
+	cmd[cmd_len] = '\0';
+
+#ifdef TRACE
+	if (strcmp(cmd, "trace on") == 0) {
+		trace_mode = true;
+		trace_address = 0;
+		gdb_send_monitor_output("Trace enabled\n");
+		gdb_send_ok();
+	} else if (strcmp(cmd, "trace off") == 0) {
+		trace_mode = false;
+		trace_address = 0;
+		gdb_send_monitor_output("Trace disabled\n");
+		gdb_send_ok();
+	} else if (strncmp(cmd, "trace ", 6) == 0) {
+		// "trace XXXX" — set trace address trigger
+		uint16_t addr = (uint16_t)strtol(cmd + 6, NULL, 16);
+		trace_address = addr;
+		trace_mode = false;
+		char msg[64];
+		snprintf(msg, sizeof(msg), "Trace will start at $%04X\n", addr);
+		gdb_send_monitor_output(msg);
+		gdb_send_ok();
+	} else {
+		gdb_send_monitor_output("Unknown command. Available: trace on|off|<addr>\n");
+		gdb_send_ok();
+	}
+#else
+	(void)cmd;
+	gdb_send_monitor_output("Trace support not compiled in (rebuild with -DENABLE_TRACE=ON)\n");
+	gdb_send_ok();
+#endif
+}
+
 static void
 handle_command(const char *pkt, int pkt_len)
 {
@@ -921,6 +991,8 @@ handle_command(const char *pkt, int pkt_len)
 				gdb_send_packet("Text=0;Data=0;Bss=0");
 			} else if (strncmp(pkt, "qSymbol::", 9) == 0) {
 				gdb_send_ok();
+			} else if (strncmp(pkt, "qRcmd,", 6) == 0) {
+				handle_monitor_command(pkt + 6);
 			} else {
 				gdb_send_empty();
 			}
@@ -1050,8 +1122,8 @@ accept_connection(void)
 	gdb_state = GDB_STATE_STOPPED;
 	recv_len = 0;
 
-	printf("[GDB] Client connected from %s:%d\n",
-	       inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+	printf("[GDB] Client connected from %s:%d (PC=$%04X)\n",
+	       inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), regs.pc); fflush(stdout);
 
 	// Clear breakpoints and watchpoints on new connection
 	for (int i = 0; i < GDB_MAX_BREAKPOINTS; i++) {
@@ -1226,6 +1298,16 @@ gdbstub_poll(void)
 			return 0; // No connection yet, keep running
 
 		case GDB_STATE_STOPPED:
+			if (client_sock == SOCKET_INVALID) {
+				// No client connected — try to accept one while halted
+				accept_connection();
+				// accept_connection sets gdb_state to STOPPED if connected
+				if (client_sock != SOCKET_INVALID) {
+					// New client just connected; send stop notification
+					gdbstub_report_stop(5); // SIGTRAP
+				}
+				return 1; // Stay halted, waiting for client
+			}
 			// CPU is halted; process GDB commands
 			recv_data();
 			process_packets();
@@ -1246,6 +1328,7 @@ gdbstub_poll(void)
 			}
 
 			if (gdb_state == GDB_STATE_STOPPED) {
+				printf("[GDB] STOP: Ctrl-C at PC=$%04X\n", regs.pc); fflush(stdout);
 				return 1; // Ctrl-C received, halt
 			}
 
@@ -1254,6 +1337,7 @@ gdbstub_poll(void)
 				gdb_state = GDB_STATE_STOPPED;
 				range_stepping = false;
 				wp_hit = false;
+				printf("[GDB] STOP: breakpoint at PC=$%04X\n", regs.pc); fflush(stdout);
 				gdbstub_report_stop(5); // SIGTRAP
 				return 1;
 			}
@@ -1300,12 +1384,16 @@ gdbstub_poll(void)
 void
 gdbstub_break(uint8_t signal)
 {
-	if (gdb_state == GDB_STATE_RUNNING || gdb_state == GDB_STATE_STOPPED) {
-		gdb_state = GDB_STATE_STOPPED;
-		range_stepping = false;
-		wp_hit = false;
-		gdbstub_report_stop(signal);
-	}
+	// Always halt the CPU when GDB is enabled, regardless of connection state.
+	// If no client is connected, we still transition to STOPPED so the CPU
+	// halts and waits for a client to reconnect.
+	printf("[GDB] STOP: gdbstub_break(sig=%d) at PC=$%04X (state=%d, connected=%d, rambank=%d, rombank=%d)\n",
+	       signal, regs.pc, gdb_state, gdb_connected,
+	       memory_get_ram_bank(), memory_get_rom_bank()); fflush(stdout);
+	gdb_state = GDB_STATE_STOPPED;
+	range_stepping = false;
+	wp_hit = false;
+	gdbstub_report_stop(signal); // safe if no client — report_stop checks client_sock
 }
 
 void

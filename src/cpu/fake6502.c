@@ -119,6 +119,9 @@ extern uint8_t read6502(uint16_t address, uint8_t bank);
 extern void write6502(uint16_t address, uint8_t bank, uint8_t value);
 extern void stop6502(uint16_t address, uint8_t bank);
 extern void vp6502();
+extern bool gdb_enabled;
+extern bool gdb_connected;
+extern void gdbstub_break(uint8_t signal);
 extern uint8_t memory_get_ram_bank();
 extern uint8_t memory_get_rom_bank();
 

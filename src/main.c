@@ -277,6 +277,7 @@ lst_for_address(uint16_t address)
 		default:
 			return NULL;
 	}
+	if (!lst) return NULL;
 	return lst[address - 0xc000];
 }
 #endif
@@ -1660,87 +1661,87 @@ emulator_loop(void *param)
 				char *lf;
 				while ((lf = strchr(lst, '\n'))) {
 					for (int i = 0; i < 120; i++) {
-						printf(" ");
+						fputc(' ', stderr);
 					}
 					if (regs.is65c816) {
-						printf("        "); // 8 extra width
+						fprintf(stderr, "        "); // 8 extra width
 					}
 					for (char *c = lst; c < lf; c++) {
-						printf("%c", *c);
+						fputc(*c, stderr);
 					}
-					printf("\n");
+					fputc('\n', stderr);
 					lst = lf + 1;
 				}
 			}
 
-			printf("[%8d] ", instruction_counter);
+			fprintf(stderr, "[%8d] ", instruction_counter);
 
 			int32_t eff_addr;
 
 			char *label = label_for_address(regs.pc);
 			int label_len = label ? strlen(label) : 0;
 			if (label) {
-				printf("%s", label);
+				fprintf(stderr, "%s", label);
 			}
 			for (int i = 0; i < 20 - label_len; i++) {
-				printf(" ");
+				fputc(' ', stderr);
 			}
 
 			if (regs.pc >= 0xc000 && regs.k == 0) {
-				printf (" %02x", memory_get_rom_bank());
+				fprintf(stderr, " %02x", memory_get_rom_bank());
 			} else if (regs.pc >= 0xa000 && regs.k == 0) {
-				printf (" %02x", memory_get_ram_bank());
+				fprintf(stderr, " %02x", memory_get_ram_bank());
 			} else {
-				printf (" --");
+				fprintf(stderr, " --");
 			}
 
-			printf(":.,%04x ", regs.pc);
+			fprintf(stderr, ":.,%04x ", regs.pc);
 
 			char disasm_line[15];
 			int len = disasm(regs.pc, regs.k, RAM, disasm_line, sizeof(disasm_line), -1, regs.status, &eff_addr);
 			for (int i = 0; i < len; i++) {
-				printf("%02x ", debug_read6502(regs.pc + i, regs.k, USE_CURRENT_X16_BANK));
+				fprintf(stderr, "%02x ", debug_read6502(regs.pc + i, regs.k, USE_CURRENT_X16_BANK));
 			}
 			for (int i = 0; i < 9 - 3 * len; i++) {
-				printf(" ");
+				fputc(' ', stderr);
 			}
-			printf("%s", disasm_line);
-			for (int i = 0; i < 15 - strlen(disasm_line); i++) {
-				printf(" ");
+			fprintf(stderr, "%s", disasm_line);
+			for (int i = 0; i < 15 - (int)strlen(disasm_line); i++) {
+				fputc(' ', stderr);
 			}
 			if (regs.is65c816) {
-				printf("C=$%04x X=$%04x Y=$%04x S=$%04x P=", regs.c, regs.x, regs.y, regs.sp);
+				fprintf(stderr, "C=$%04x X=$%04x Y=$%04x S=$%04x P=", regs.c, regs.x, regs.y, regs.sp);
 				for (int i = 7; i >= 0; i--) {
-					printf("%c", (regs.status & (1 << i)) ? "czidxmvn"[i] : '-');
+					fprintf(stderr, "%c", (regs.status & (1 << i)) ? "czidxmvn"[i] : '-');
 				}
 
-				putchar(regs.e ? 'e' : '-');
+				fputc(regs.e ? 'e' : '-', stderr);
 			} else {
-				printf("A=$%02x X=$%02x Y=$%02x S=$%02x P=", regs.a, regs.xl, regs.yl, regs.sp & 0xff);
+				fprintf(stderr, "A=$%02x X=$%02x Y=$%02x S=$%02x P=", regs.a, regs.xl, regs.yl, regs.sp & 0xff);
 				for (int i = 7; i >= 0; i--) {
-					printf("%c", (regs.status & (1 << i)) ? "czidb-vn"[i] : '-');
+					fprintf(stderr, "%c", (regs.status & (1 << i)) ? "czidb-vn"[i] : '-');
 				}
 			}
 
 			if (eff_addr == 0x9f23 && regs.k == 0) {
-				printf(" VRAM=$%05x ", video_get_address(0));
+				fprintf(stderr, " VRAM=$%05x ", video_get_address(0));
 			} else if (eff_addr == 0x9f24 && regs.k == 0) {
-				printf(" VRAM=$%05x ", video_get_address(1));
+				fprintf(stderr, " VRAM=$%05x ", video_get_address(1));
 			} else if (eff_addr >= 0xc000 && regs.k == 0) {
-				printf(" EA=$%02x:%04x ", memory_get_rom_bank(), eff_addr);
+				fprintf(stderr, " EA=$%02x:%04x ", memory_get_rom_bank(), eff_addr);
 			} else if (eff_addr >= 0xa000 && regs.k == 0) {
-				printf(" EA=$%02x:%04x ", memory_get_ram_bank(), eff_addr);
+				fprintf(stderr, " EA=$%02x:%04x ", memory_get_ram_bank(), eff_addr);
 			} else if (eff_addr >= 0) {
-				printf(" EA=$--:%04x ", eff_addr);
+				fprintf(stderr, " EA=$--:%04x ", eff_addr);
 			} else {
-				printf("             ");
+				fprintf(stderr, "             ");
 			}
 
 			if (lst) {
-				printf("%s      %s", regs.is65c816 ? "" : " ", lst);
+				fprintf(stderr, "%s      %s", regs.is65c816 ? "" : " ", lst);
 			}
 
-			printf("\n");
+			fprintf(stderr, "\n");
 		}
 #endif
 
