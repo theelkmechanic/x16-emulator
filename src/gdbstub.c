@@ -832,6 +832,7 @@ handle_v_command(const char *data, int len)
 
 #ifdef TRACE
 extern bool trace_mode;
+extern bool trace_compact;
 extern uint16_t trace_address;
 #endif
 
@@ -865,27 +866,37 @@ handle_monitor_command(const char *hex_cmd)
 	cmd[cmd_len] = '\0';
 
 #ifdef TRACE
-	if (strcmp(cmd, "trace on") == 0) {
+	if (strcmp(cmd, "trace on") == 0 || strcmp(cmd, "trace on full") == 0) {
 		trace_mode = true;
+		trace_compact = false;
 		trace_address = 0;
-		gdb_send_monitor_output("Trace enabled\n");
+		gdb_send_monitor_output("Trace enabled (full)\n");
+		gdb_send_ok();
+	} else if (strcmp(cmd, "trace on compact") == 0) {
+		trace_mode = true;
+		trace_compact = true;
+		trace_address = 0;
+		gdb_send_monitor_output("Trace enabled (compact)\n");
 		gdb_send_ok();
 	} else if (strcmp(cmd, "trace off") == 0) {
 		trace_mode = false;
 		trace_address = 0;
+		fflush(stderr);
 		gdb_send_monitor_output("Trace disabled\n");
 		gdb_send_ok();
 	} else if (strncmp(cmd, "trace ", 6) == 0) {
-		// "trace XXXX" — set trace address trigger
-		uint16_t addr = (uint16_t)strtol(cmd + 6, NULL, 16);
+		// "trace XXXX [compact]" — set trace address trigger
+		char *endptr;
+		uint16_t addr = (uint16_t)strtol(cmd + 6, &endptr, 16);
 		trace_address = addr;
 		trace_mode = false;
-		char msg[64];
-		snprintf(msg, sizeof(msg), "Trace will start at $%04X\n", addr);
+		trace_compact = (endptr && *endptr == ' ' && strcmp(endptr + 1, "compact") == 0);
+		char msg[80];
+		snprintf(msg, sizeof(msg), "Trace will start at $%04X (%s)\n", addr, trace_compact ? "compact" : "full");
 		gdb_send_monitor_output(msg);
 		gdb_send_ok();
 	} else {
-		gdb_send_monitor_output("Unknown command. Available: trace on|off|<addr>\n");
+		gdb_send_monitor_output("Unknown command. Available: trace on [compact|full]|off|<addr> [compact]\n");
 		gdb_send_ok();
 	}
 #else

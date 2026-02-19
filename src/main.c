@@ -145,6 +145,7 @@ uint8_t MHZ = 8;
 
 #ifdef TRACE
 bool trace_mode = false;
+bool trace_compact = false;
 uint16_t trace_address = 0;
 #endif
 
@@ -1656,92 +1657,159 @@ emulator_loop(void *param)
 			trace_mode = true;
 		}
 		if (trace_mode && !waiting) {
-			char *lst = lst_for_address(regs.pc);
-			if (lst) {
-				char *lf;
-				while ((lf = strchr(lst, '\n'))) {
-					for (int i = 0; i < 120; i++) {
-						fputc(' ', stderr);
-					}
-					if (regs.is65c816) {
-						fprintf(stderr, "        "); // 8 extra width
-					}
-					for (char *c = lst; c < lf; c++) {
-						fputc(*c, stderr);
-					}
-					fputc('\n', stderr);
-					lst = lf + 1;
-				}
+			// One-time: switch stderr to full buffering for trace performance.
+			// Without this, macOS stderr is unbuffered and every fputc is a syscall.
+			static bool trace_io_init = false;
+			if (!trace_io_init) {
+				static char trace_stderr_buf[1 << 16];
+				setvbuf(stderr, trace_stderr_buf, _IOFBF, sizeof(trace_stderr_buf));
+				trace_io_init = true;
 			}
 
-			fprintf(stderr, "[%8d] ", instruction_counter);
+			// Build entire trace line in a buffer, then write once.
+			char trace_buf[4096];
+			int pos = 0;
+
+			// Listing preamble (full mode only, requires rom_lst.h data)
+			char *lst = NULL;
+			if (!trace_compact) {
+				lst = lst_for_address(regs.pc);
+				if (lst) {
+					char *lf;
+					int pad_width = regs.is65c816 ? 128 : 120;
+					while ((lf = strchr(lst, '\n'))) {
+						memset(trace_buf + pos, ' ', pad_width);
+						pos += pad_width;
+						int seg_len = (int)(lf - lst);
+						if (seg_len > 0) {
+							memcpy(trace_buf + pos, lst, seg_len);
+							pos += seg_len;
+						}
+						trace_buf[pos++] = '\n';
+						lst = lf + 1;
+						if (pos > (int)sizeof(trace_buf) - 512) {
+							fwrite(trace_buf, 1, pos, stderr);
+							pos = 0;
+						}
+					}
+				}
+			}
 
 			int32_t eff_addr;
+			pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, "[%8d] ", instruction_counter);
 
-			char *label = label_for_address(regs.pc);
-			int label_len = label ? strlen(label) : 0;
-			if (label) {
-				fprintf(stderr, "%s", label);
-			}
-			for (int i = 0; i < 20 - label_len; i++) {
-				fputc(' ', stderr);
+			// Label column (full mode only, requires rom_labels.h data)
+			if (!trace_compact) {
+				char *label = label_for_address(regs.pc);
+				int label_len = label ? (int)strlen(label) : 0;
+				if (label_len > 0) {
+					memcpy(trace_buf + pos, label, label_len);
+					pos += label_len;
+				}
+				if (label_len < 20) {
+					memset(trace_buf + pos, ' ', 20 - label_len);
+					pos += 20 - label_len;
+				}
 			}
 
+			// Bank
 			if (regs.pc >= 0xc000 && regs.k == 0) {
-				fprintf(stderr, " %02x", memory_get_rom_bank());
+				pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " %02x", memory_get_rom_bank());
 			} else if (regs.pc >= 0xa000 && regs.k == 0) {
-				fprintf(stderr, " %02x", memory_get_ram_bank());
+				pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " %02x", memory_get_ram_bank());
 			} else {
-				fprintf(stderr, " --");
+				memcpy(trace_buf + pos, " --", 3);
+				pos += 3;
 			}
 
-			fprintf(stderr, ":.,%04x ", regs.pc);
+			pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, ":.,%04x ", regs.pc);
 
+			// Disassembly (always needed for disasm text + eff_addr)
 			char disasm_line[15];
 			int len = disasm(regs.pc, regs.k, RAM, disasm_line, sizeof(disasm_line), -1, regs.status, &eff_addr);
-			for (int i = 0; i < len; i++) {
-				fprintf(stderr, "%02x ", debug_read6502(regs.pc + i, regs.k, USE_CURRENT_X16_BANK));
+
+			// Raw instruction bytes (full mode only)
+			if (!trace_compact) {
+				for (int i = 0; i < len; i++) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, "%02x ", debug_read6502(regs.pc + i, regs.k, USE_CURRENT_X16_BANK));
+				}
+				if (3 * len < 9) {
+					memset(trace_buf + pos, ' ', 9 - 3 * len);
+					pos += 9 - 3 * len;
+				}
 			}
-			for (int i = 0; i < 9 - 3 * len; i++) {
-				fputc(' ', stderr);
+
+			// Disassembly text
+			int dlen = (int)strlen(disasm_line);
+			memcpy(trace_buf + pos, disasm_line, dlen);
+			pos += dlen;
+			if (dlen < 15) {
+				memset(trace_buf + pos, ' ', 15 - dlen);
+				pos += 15 - dlen;
 			}
-			fprintf(stderr, "%s", disasm_line);
-			for (int i = 0; i < 15 - (int)strlen(disasm_line); i++) {
-				fputc(' ', stderr);
-			}
+
+			// Registers and status flags
 			if (regs.is65c816) {
-				fprintf(stderr, "C=$%04x X=$%04x Y=$%04x S=$%04x P=", regs.c, regs.x, regs.y, regs.sp);
+				pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, "C=$%04x X=$%04x Y=$%04x S=$%04x P=", regs.c, regs.x, regs.y, regs.sp);
 				for (int i = 7; i >= 0; i--) {
-					fprintf(stderr, "%c", (regs.status & (1 << i)) ? "czidxmvn"[i] : '-');
+					trace_buf[pos++] = (regs.status & (1 << i)) ? "czidxmvn"[i] : '-';
 				}
-
-				fputc(regs.e ? 'e' : '-', stderr);
+				trace_buf[pos++] = regs.e ? 'e' : '-';
 			} else {
-				fprintf(stderr, "A=$%02x X=$%02x Y=$%02x S=$%02x P=", regs.a, regs.xl, regs.yl, regs.sp & 0xff);
+				pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, "A=$%02x X=$%02x Y=$%02x S=$%02x P=", regs.a, regs.xl, regs.yl, regs.sp & 0xff);
 				for (int i = 7; i >= 0; i--) {
-					fprintf(stderr, "%c", (regs.status & (1 << i)) ? "czidb-vn"[i] : '-');
+					trace_buf[pos++] = (regs.status & (1 << i)) ? "czidb-vn"[i] : '-';
 				}
 			}
 
-			if (eff_addr == 0x9f23 && regs.k == 0) {
-				fprintf(stderr, " VRAM=$%05x ", video_get_address(0));
-			} else if (eff_addr == 0x9f24 && regs.k == 0) {
-				fprintf(stderr, " VRAM=$%05x ", video_get_address(1));
-			} else if (eff_addr >= 0xc000 && regs.k == 0) {
-				fprintf(stderr, " EA=$%02x:%04x ", memory_get_rom_bank(), eff_addr);
-			} else if (eff_addr >= 0xa000 && regs.k == 0) {
-				fprintf(stderr, " EA=$%02x:%04x ", memory_get_ram_bank(), eff_addr);
-			} else if (eff_addr >= 0) {
-				fprintf(stderr, " EA=$--:%04x ", eff_addr);
+			// Effective address
+			if (!trace_compact) {
+				// Full mode: always 13 chars (padded)
+				if (eff_addr == 0x9f23 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " VRAM=$%05x ", video_get_address(0));
+				} else if (eff_addr == 0x9f24 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " VRAM=$%05x ", video_get_address(1));
+				} else if (eff_addr >= 0xc000 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " EA=$%02x:%04x ", memory_get_rom_bank(), eff_addr);
+				} else if (eff_addr >= 0xa000 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " EA=$%02x:%04x ", memory_get_ram_bank(), eff_addr);
+				} else if (eff_addr >= 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " EA=$--:%04x ", eff_addr);
+				} else {
+					memcpy(trace_buf + pos, "             ", 13);
+					pos += 13;
+				}
 			} else {
-				fprintf(stderr, "             ");
+				// Compact mode: only print EA when present (no padding)
+				if (eff_addr == 0x9f23 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " VRAM=$%05x", video_get_address(0));
+				} else if (eff_addr == 0x9f24 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " VRAM=$%05x", video_get_address(1));
+				} else if (eff_addr >= 0xc000 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " EA=%02x:%04x", memory_get_rom_bank(), eff_addr);
+				} else if (eff_addr >= 0xa000 && regs.k == 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " EA=%02x:%04x", memory_get_ram_bank(), eff_addr);
+				} else if (eff_addr >= 0) {
+					pos += snprintf(trace_buf + pos, sizeof(trace_buf) - pos, " EA=--:%04x", eff_addr);
+				}
 			}
 
-			if (lst) {
-				fprintf(stderr, "%s      %s", regs.is65c816 ? "" : " ", lst);
+			// Listing suffix (full mode only)
+			if (!trace_compact && lst) {
+				if (!regs.is65c816) {
+					trace_buf[pos++] = ' ';
+				}
+				memcpy(trace_buf + pos, "      ", 6);
+				pos += 6;
+				int lst_len = (int)strlen(lst);
+				int avail = (int)sizeof(trace_buf) - pos - 2;
+				if (lst_len > avail) lst_len = avail;
+				memcpy(trace_buf + pos, lst, lst_len);
+				pos += lst_len;
 			}
 
-			fprintf(stderr, "\n");
+			trace_buf[pos++] = '\n';
+			fwrite(trace_buf, 1, pos, stderr);
 		}
 #endif
 
